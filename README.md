@@ -1,6 +1,6 @@
 # Shiny Credit Card Fraud Detection Dashboard
 
-This is a Shiny R application that provides an interactive dashboard for evaluating and comparing machine learning models for credit card fraud detection. This project extends the comprehensive analysis from the [Credit Card Fraud Prediction](https://github.com/itxtx/credit_card_fraud_prediction) repository.
+This is a Shiny R application that provides an interactive dashboard for evaluating and comparing machine learning models for credit card fraud detection. This project extends the comprehensive analysis from the [Credit Card Fraud Prediction](https://github.com/itxtx/credit_card_fraud_prediction) repository. See the dashboard at [https://itxtx.shinyapps.io/shiny_credit_app/].
 
 ## Overview
 
