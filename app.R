@@ -42,7 +42,7 @@ ae_preds <- load_safe_csv("ae_predictions.csv")
 
 # --- Helper function for metrics ---
 calculate_metrics <- function(y_true, y_pred_scores, threshold, direction = "gte") {
-  if (length(y_true) == 0) return(list(precision = 0, recall = 0, f1_score = 0, mcc = 0, fpr_at_threshold = 0, tpr_at_threshold = 0))
+  if (length(y_true) == 0) return(list(precision = 0, recall = 0, f1_score = 0, mcc = 0, fpr_at_threshold = 0, tpr_at_threshold = 0, specificity = 0))
   
   y_pred_binary <- if (direction == "gte") {
     as.numeric(y_pred_scores >= threshold)
@@ -62,11 +62,12 @@ calculate_metrics <- function(y_true, y_pred_scores, threshold, direction = "gte
   denominator_mcc <- sqrt(as.double(tp + fp) * as.double(tp + fn) * as.double(tn + fp) * as.double(tn + fn))
   mcc <- ifelse(denominator_mcc == 0, 0, numerator_mcc / denominator_mcc)
   fpr_at_threshold <- ifelse(fp + tn == 0, 0, fp / (fp + tn))
+  specificity <- ifelse(tn + fp == 0, 0, tn / (tn + fp))  # True Negative Rate
   
   return(list(
     confusion_matrix = matrix(c(tn, fp, fn, tp), nrow = 2, byrow = TRUE, dimnames = list(c("Actual 0", "Actual 1"), c("Pred 0", "Pred 1"))),
     precision = precision, recall = recall, f1_score = f1_score, mcc = mcc,
-    fpr_at_threshold = fpr_at_threshold, tpr_at_threshold = recall
+    fpr_at_threshold = fpr_at_threshold, tpr_at_threshold = recall, specificity = specificity
   ))
 }
 
@@ -114,7 +115,8 @@ ui <- dashboardPage(
             h4("Precision: ", textOutput("precision", inline = TRUE)),
             h4("Recall (TPR): ", textOutput("recall", inline = TRUE)),
             h4("F1-Score: ", textOutput("f1_score", inline = TRUE)),
-            h4("MCC: ", textOutput("mcc", inline = TRUE))
+            h4("MCC: ", textOutput("mcc", inline = TRUE)),
+            h4("Specificity: ", textOutput("specificity", inline = TRUE))
           )
         ),
         fluidRow(
@@ -289,6 +291,7 @@ server <- function(input, output, session) {
   output$recall <- renderText({ round(metrics_output()$recall, 4) })
   output$f1_score <- renderText({ round(metrics_output()$f1_score, 4) })
   output$mcc <- renderText({ round(metrics_output()$mcc, 4) })
+  output$specificity <- renderText({ round(metrics_output()$specificity, 4) })
   
 
   
@@ -296,17 +299,42 @@ server <- function(input, output, session) {
     req(input$model_select)
     data <- selected_data()
     
-    # **MODIFIED:** Score inversion is REMOVED. PRROC will now correctly
-    # generate a visually inverted curve for models with inverted scores.
+    # Get the direction for this model
+    direction <- model_score_directions[[input$model_select]]
+    
+    # For ROC curves, we still use PRROC
     scores <- data$predicted_score
+    if (direction == "lte") {
+      # Invert scores so higher values indicate fraud for PRROC
+      scores <- -scores
+    }
     
     scores_class0 <- scores[data$true_label == 0]
     scores_class1 <- scores[data$true_label == 1]
     
     if (length(scores_class0) > 0 && length(scores_class1) > 0) {
-      pr_result <- pr.curve(scores.class0 = scores_class0, scores.class1 = scores_class1, curve = TRUE)
       roc_result <- roc.curve(scores.class0 = scores_class0, scores.class1 = scores_class1, curve = TRUE)
-      return(list(pr = pr_result, roc = roc_result))
+      
+      # Calculate threshold-based PR curve manually
+      # Generate thresholds from min to max score
+      score_range <- range(data$predicted_score)
+      thresholds <- seq(score_range[1], score_range[2], length.out = 100)
+      
+      pr_points <- data.frame(threshold = thresholds, precision = NA, recall = NA)
+      
+      for (i in seq_along(thresholds)) {
+        thresh <- thresholds[i]
+        metrics <- calculate_metrics(data$true_label, data$predicted_score, thresh, direction)
+        pr_points$precision[i] <- metrics$precision
+        pr_points$recall[i] <- metrics$recall
+      }
+      
+      # Calculate AUCPR using trapezoidal rule
+      aucpr <- sum(diff(pr_points$recall) * (pr_points$precision[-1] + pr_points$precision[-length(pr_points$precision)]) / 2)
+      
+      return(list(pr = list(curve = as.matrix(pr_points[, c("recall", "precision")]), auc.integral = aucpr), 
+                  roc = roc_result, 
+                  model = input$model_select))
     } else {
       return(NULL)
     }
@@ -325,13 +353,20 @@ server <- function(input, output, session) {
     pr_plot_data <- data.frame(recall = pr_result$curve[, 1], precision = pr_result$curve[, 2])
     metrics_at_threshold <- metrics_output()
     
+    # Add debugging info
+    data <- selected_data()
+    n_fraud <- sum(data$true_label == 1)
+    n_total <- nrow(data)
+    score_range <- range(data$predicted_score)
+    
     p <- ggplot(pr_plot_data, aes(x = recall, y = precision)) +
       geom_line(color = "#E41A1C", linewidth = 1) +
       annotate("point", x = metrics_at_threshold$recall, y = metrics_at_threshold$precision,
                color = "red", size = 4, shape = 19, alpha = 0.8) +
       annotate("text", x = metrics_at_threshold$recall, y = metrics_at_threshold$precision,
                label = paste0("Thresh: ", round(input$threshold, 3)), vjust = -1.5, color = "red") +
-      labs(title = paste0("Precision-Recall Curve (AUCPR = ", round(pr_result$auc.integral, 4), ")"),
+      labs(title = paste0(input$model_select, " - Precision-Recall Curve (AUCPR = ", round(pr_result$auc.integral, 4), ")"),
+           subtitle = paste("Model:", input$model_select, "| Data:", n_fraud, "fraud cases out of", n_total, "total (", round(100*n_fraud/n_total, 2), "% fraud rate) | Score range:", round(score_range[1], 6), "to", round(score_range[2], 6)),
            x = "Recall", y = "Precision") +
       theme_minimal() + coord_cartesian(xlim = c(0, 1), ylim = c(0, 1))
     return(p)
@@ -348,6 +383,10 @@ server <- function(input, output, session) {
     roc_plot_data <- data.frame(tpr = roc_result$curve[, 1], fpr = roc_result$curve[, 2])
     metrics_at_threshold <- metrics_output()
     
+    # Add debugging info
+    data <- selected_data()
+    score_range <- range(data$predicted_score)
+    
     p <- ggplot(roc_plot_data, aes(x = fpr, y = tpr)) +
       geom_line(color = "#E41A1C", linewidth = 1) +
       geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "grey") +
@@ -355,7 +394,8 @@ server <- function(input, output, session) {
                color = "red", size = 4, shape = 19, alpha = 0.8) +
       annotate("text", x = metrics_at_threshold$fpr_at_threshold, y = metrics_at_threshold$tpr_at_threshold,
                label = paste0("Thresh: ", round(input$threshold, 3)), vjust = -1.5, color = "red") +
-      labs(title = paste0("ROC Curve (AUROC = ", round(roc_result$auc, 4), ")"),
+      labs(title = paste0(input$model_select, " - ROC Curve (AUROC = ", round(roc_result$auc, 4), ")"),
+           subtitle = paste("Model:", input$model_select, "| Score range:", round(score_range[1], 6), "to", round(score_range[2], 6)),
            x = "False Positive Rate (FPR)", y = "True Positive Rate (TPR)") +
       theme_minimal() + coord_cartesian(xlim = c(0, 1), ylim = c(0, 1))
     return(p)
@@ -369,15 +409,25 @@ server <- function(input, output, session) {
       Class = factor(data$true_label, levels = c(0, 1), labels = c("Normal", "Fraud"))
     )
     
-    ggplot(plot_data, aes(x = Score, fill = Class)) +
-      geom_density(alpha = 0.7) +
+    # Calculate optimal number of bins based on data size
+    n_bins <- min(50, max(20, round(nrow(plot_data) / 100)))
+    
+    # Create faceted histogram for better visibility
+    p <- ggplot(plot_data, aes(x = Score, fill = Class)) +
+      geom_histogram(bins = n_bins, alpha = 0.7, position = "identity") +
       geom_vline(xintercept = input$threshold, linetype = "dashed", color = "red", linewidth = 1.2) +
       annotate("text", x = input$threshold, y = Inf,
                label = paste0("Thresh: ", round(input$threshold, 3)),
                vjust = 1.5, hjust = ifelse(input$threshold > median(plot_data$Score), 1.1, -0.1), color = "red") +
-      labs(title = "Predicted Score Distribution by Class", x = "Predicted Score", y = "Density") +
-      scale_fill_manual(values = c("#377EB8", "#E41A1C")) +
-      theme_minimal() + theme(legend.position = "top")
+      labs(title = "Predicted Score Distribution by Class", 
+           subtitle = paste("Histogram with", n_bins, "bins"),
+           x = "Predicted Score", y = "Count") +
+      scale_fill_manual(values = c("Normal" = "#377EB8", "Fraud" = "#E41A1C")) +
+      theme_minimal() + 
+      theme(legend.position = "top") +
+      facet_wrap(~Class, scales = "free_y", ncol = 1)
+    
+    return(p)
   })
   
   output$anomaly_distribution_plot <- renderPlot({
@@ -457,7 +507,8 @@ server <- function(input, output, session) {
       F1_Score = metrics$f1_score,
       MCC = metrics$mcc,
       FPR = metrics$fpr_at_threshold,
-      TPR = metrics$tpr_at_threshold
+      TPR = metrics$tpr_at_threshold,
+      Specificity = metrics$specificity
     ))
   }
   
@@ -566,12 +617,13 @@ server <- function(input, output, session) {
     }
     
     # Format for display
-    display_data <- comparison_data[, c("Model", "Threshold", "Precision", "Recall", "F1_Score", "MCC")]
+    display_data <- comparison_data[, c("Model", "Threshold", "Precision", "Recall", "F1_Score", "MCC", "Specificity")]
     display_data$Precision <- round(display_data$Precision, 4)
     display_data$Recall <- round(display_data$Recall, 4)
     display_data$F1_Score <- round(display_data$F1_Score, 4)
     display_data$MCC <- round(display_data$MCC, 4)
     display_data$Threshold <- round(display_data$Threshold, 4)
+    display_data$Specificity <- round(display_data$Specificity, 4)
     
     return(display_data)
   }, rownames = FALSE)
@@ -690,7 +742,7 @@ server <- function(input, output, session) {
     fn <- cm[2, 1]
     
     # Calculate additional metrics
-    specificity <- ifelse(tn + fp == 0, 0, tn / (tn + fp))  # True Negative Rate
+    specificity <- ifelse(tn + fp == 0, 0, tn / (tn + fp))  # True Negative Rate (TN / (TN + FP))
     sensitivity <- ifelse(tp + fn == 0, 0, tp / (tp + fn))  # Same as recall/TPR
     precision <- ifelse(tp + fp == 0, 0, tp / (tp + fp))
     recall <- ifelse(tp + fn == 0, 0, tp / (tp + fn))
